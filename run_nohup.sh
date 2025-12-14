@@ -9,7 +9,9 @@ conda activate Training
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Run the training script in the background
-nohup python -u train_math_on_policy_distill.py > nohup.out 2>&1 &
+nohup python -u train_math_on_policy_distill.py \
+    --resume_from_checkpoint runs/qwen2.5_gsm8k_distill/ckpt_interrupted_20 \
+    > nohup.out 2>&1 &
 
 # Get the PID of the last background process
 PID=$!

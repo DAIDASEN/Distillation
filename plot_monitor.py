@@ -11,17 +11,24 @@ import argparse
 import time
 
 def load_logs(log_path):
-    """加载训练日志"""
+    """加载训练日志，并去重（保留最新的step）"""
     if not os.path.exists(log_path):
         return []
-    logs = []
+    
+    logs_dict = {}
     with open(log_path, "r") as f:
         for line in f:
             try:
-                logs.append(json.loads(line))
+                entry = json.loads(line)
+                step = entry.get('step')
+                if step is not None:
+                    logs_dict[step] = entry
             except:
                 pass
-    return logs
+    
+    # 按步数排序
+    sorted_steps = sorted(logs_dict.keys())
+    return [logs_dict[s] for s in sorted_steps]
 
 def plot_training_curves(logs, save_path=None, show=True):
     """绘制训练曲线"""

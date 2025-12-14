@@ -11,17 +11,24 @@ import argparse
 from datetime import datetime
 
 def load_logs(log_path):
-    """加载训练日志"""
+    """加载训练日志，并去重（保留最新的step）"""
     if not os.path.exists(log_path):
         return []
-    logs = []
+    
+    logs_dict = {}
     with open(log_path, "r") as f:
         for line in f:
             try:
-                logs.append(json.loads(line))
+                entry = json.loads(line)
+                step = entry.get('step')
+                if step is not None:
+                    logs_dict[step] = entry
             except:
                 pass
-    return logs
+    
+    # 按步数排序
+    sorted_steps = sorted(logs_dict.keys())
+    return [logs_dict[s] for s in sorted_steps]
 
 def load_samples(samples_path, last_n=5):
     """加载最近的样本"""
@@ -46,12 +53,13 @@ def print_stats(logs, window=20):
     
     # 计算移动平均
     avg_loss = sum(l['loss'] for l in recent) / len(recent)
-    avg_acc = sum(l['accuracy'] for l in recent) / len(recent)
+    avg_acc = sum(l.get('student_acc', l.get('accuracy', 0)) for l in recent) / len(recent)
     avg_ans_rate = sum(l['answer_found_rate'] for l in recent) / len(recent)
     avg_trunc = sum(l['truncation_rate'] for l in recent) / len(recent)
     avg_len = sum(l['avg_new_tokens'] for l in recent) / len(recent)
     
     latest = logs[-1]
+    latest_acc = latest.get('student_acc', latest.get('accuracy', 0))
     
     print("\n" + "="*70)
     print(f"📊 训练监控 - {datetime.now().strftime('%H:%M:%S')} | Step: {latest['step']}")
@@ -61,7 +69,7 @@ def print_stats(logs, window=20):
     print(f"\n{'指标':<20} {'当前值':<15} {'近{window}步平均':<15}")
     print("-"*50)
     print(f"{'Loss':<20} {latest['loss']:<15.4f} {avg_loss:<15.4f}")
-    print(f"{'Accuracy':<20} {latest['accuracy']:<15.2%} {avg_acc:<15.2%}")
+    print(f"{'Accuracy':<20} {latest_acc:<15.2%} {avg_acc:<15.2%}")
     print(f"{'Answer Found Rate':<20} {latest['answer_found_rate']:<15.2%} {avg_ans_rate:<15.2%}")
     print(f"{'Truncation Rate':<20} {latest['truncation_rate']:<15.2%} {avg_trunc:<15.2%}")
     print(f"{'Avg Tokens':<20} {latest['avg_new_tokens']:<15.1f} {avg_len:<15.1f}")
@@ -76,7 +84,7 @@ def print_stats(logs, window=20):
     
     # 趋势分析
     if len(logs) >= 20:
-        old_acc = sum(l['accuracy'] for l in logs[-40:-20]) / 20 if len(logs) >= 40 else avg_acc
+        old_acc = sum(l.get('student_acc', l.get('accuracy', 0)) for l in logs[-40:-20]) / 20 if len(logs) >= 40 else avg_acc
         trend = "📈 上升" if avg_acc > old_acc else ("📉 下降" if avg_acc < old_acc else "➡️ 稳定")
         print(f"准确率趋势: {trend}")
 
