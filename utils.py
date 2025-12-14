@@ -13,12 +13,31 @@ def set_seed(seed: int = 42):
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def compute_log_probs(model, input_ids, attention_mask, labels, chunk_size: int = 128):
+def compute_log_probs(model, input_ids, attention_mask, labels, chunk_size: int = 128, batch_chunk_size: int = 1):
     """
     返回 [B, T] 的 token log-prob（第 0 位补 0）。
     关键：不再 permute logits 到 [B, V, T]，避免 cross_entropy 内部触发大规模拷贝；
          采用时间维分块，降低峰值显存。
+    新增：batch_chunk_size，支持对 batch 维度进行切分，防止 OOM。
     """
+    B, T = input_ids.shape
+    if B > batch_chunk_size:
+        log_probs_list = []
+        for i in range(0, B, batch_chunk_size):
+            end = min(i + batch_chunk_size, B)
+            batch_input_ids = input_ids[i:end]
+            batch_attention_mask = attention_mask[i:end]
+            batch_labels = labels[i:end]
+            
+            # 递归调用处理子 batch
+            batch_log_probs = compute_log_probs(
+                model, batch_input_ids, batch_attention_mask, batch_labels, 
+                chunk_size=chunk_size, batch_chunk_size=batch_chunk_size
+            )
+            log_probs_list.append(batch_log_probs)
+        
+        return torch.cat(log_probs_list, dim=0)
+
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     logits = outputs.logits  # [B, T, V]
 

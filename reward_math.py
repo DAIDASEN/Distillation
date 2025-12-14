@@ -4,6 +4,11 @@ import torch
 
 def extract_answer(text: str) -> str:
     """从文本中提取最终数字答案"""
+    # 优先匹配 \boxed{...}
+    boxed_match = re.search(r"\\boxed\{([^}]+)\}", text)
+    if boxed_match:
+        return boxed_match.group(1).strip()
+
     if "####" not in text:
         return ""
     # Take the last segment after ####

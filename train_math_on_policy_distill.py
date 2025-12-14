@@ -2,6 +2,8 @@
 import os
 import argparse
 import json
+import signal
+import sys
 from typing import List, Tuple
 
 import torch
@@ -10,7 +12,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList, BitsAndBytesConfig
 
 from utils import set_seed, get_device, compute_log_probs
-from data_loader import load_deepscaler, iter_deepscaler_batches
+from data_loader import load_gsm8k, iter_gsm8k_batches
 from reward_math import compute_reward_batch
 
 # --- Helper Functions ---
@@ -22,22 +24,26 @@ def apply_chat_template_no_thinking(tokenizer, messages):
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 class AnswerStopper(StoppingCriteria):
-    def __init__(self, tokenizer, window=128):
+    def __init__(self, tokenizer, prompt_len, window=128):
         self.tokenizer = tokenizer
+        self.prompt_len = prompt_len  # Track where the prompt ends
         self.window = window
         self.stop_strings = ["####", "\\boxed{"]
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        # Check only the last 'window' tokens for efficiency
-        # We check if ALL sequences in the batch have encountered the stop string.
-        
+        # Check only the GENERATED tokens (after prompt), not the prompt itself
         batch_size = input_ids.shape[0]
         finished = [False] * batch_size
         
         for i in range(batch_size):
-            # Get last window tokens
-            last_tokens = input_ids[i, -self.window:]
-            decoded = self.tokenizer.decode(last_tokens, skip_special_tokens=True)
+            # Only check tokens AFTER the prompt
+            generated_tokens = input_ids[i, self.prompt_len:]
+            if generated_tokens.numel() == 0:
+                # No tokens generated yet
+                continue
+            # Get last window tokens of generated part only
+            check_tokens = generated_tokens[-self.window:] if generated_tokens.numel() > self.window else generated_tokens
+            decoded = self.tokenizer.decode(check_tokens, skip_special_tokens=True)
             for s in self.stop_strings:
                 if s in decoded:
                     finished[i] = True
@@ -51,8 +57,8 @@ def build_prompts(questions):
     messages_batch = []
     for q in questions:
         messages = [
-            {"role": "system", "content": "You are a math problem solving assistant.\n\nRequirements:\n1) Keep your reasoning concise (no more than 20 lines).\n2) You MUST output the final answer on a separate line in the exact format: \"#### <final_number>\".\n3) After printing the \"####\" line, STOP immediately and output nothing else."},
-            {"role": "user", "content": q},
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": f"{q}\n\nPlease reason step by step, and put your final answer at the end in the format: #### <answer>"},
         ]
         messages_batch.append(messages)
     return messages_batch
@@ -81,13 +87,35 @@ def group_normalize_rewards(rewards, group_indices):
             norm_rewards[idx] = rewards[idx]
     return norm_rewards
 
+def generate_teacher_outputs(model, tokenizer, input_ids, attention_mask, max_new_tokens, device):
+    """教师模型生成（每个问题只生成1个样本，用于对比）"""
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+    prompt_len = input_ids.shape[1]
+    
+    stopper = AnswerStopper(tokenizer, prompt_len=prompt_len, window=128)
+    stopping_criteria = StoppingCriteriaList([stopper])
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,  # Greedy for teacher
+            pad_token_id=tokenizer.pad_token_id,
+            stopping_criteria=stopping_criteria
+        )
+    
+    decoded_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    return decoded_texts
+
 def generate_student_rollouts(model, tokenizer, input_ids, attention_mask, max_new_tokens, device, args):
     input_ids = input_ids.to(device)
     attention_mask = attention_mask.to(device)
     prompt_len = input_ids.shape[1]
     
-    # Setup stopping criteria
-    stopper = AnswerStopper(tokenizer, window=128)
+    # Setup stopping criteria - pass prompt_len so it only checks generated tokens
+    stopper = AnswerStopper(tokenizer, prompt_len=prompt_len, window=128)
     stopping_criteria = StoppingCriteriaList([stopper])
     
     model.eval()
@@ -192,18 +220,17 @@ def generate_student_rollouts(model, tokenizer, input_ids, attention_mask, max_n
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--student_model", type=str, default="Qwen/Qwen3-1.7B")
-    # A.1 Change default teacher model
-    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--k_samples", type=int, default=4)
+    parser.add_argument("--student_model", type=str, default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--k_samples", type=int, default=8)
     # C.1 Change default max_new_tokens
-    parser.add_argument("--max_new_tokens", type=int, default=1536)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--lambda_env", type=float, default=1.0)
     parser.add_argument("--lambda_kl", type=float, default=0.5)
-    parser.add_argument("--output_dir", type=str, default="runs/qwen3_distill")
+    parser.add_argument("--output_dir", type=str, default="runs/qwen2.5_gsm8k_distill")
     
     # F. Generation parameters
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -257,12 +284,25 @@ def main():
     
     optimizer = AdamW(student.parameters(), lr=args.lr)
     
-    # Load DeepScaleR dataset
-    ds = load_deepscaler()
-    iter_batches = iter_deepscaler_batches
+    # Load GSM8K dataset
+    ds = load_gsm8k()
+    iter_batches = iter_gsm8k_batches
     
     student.train()
     global_step = 0
+
+    # --- Signal Handler for Graceful Shutdown ---
+    def signal_handler(sig, frame):
+        print(f"\nReceived signal {sig}. Saving checkpoint at step {global_step}...")
+        save_path = os.path.join(args.output_dir, f"ckpt_interrupted_{global_step}")
+        student.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        print(f"Checkpoint saved to {save_path}")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     pbar = tqdm(total=args.max_steps)
 
     while global_step < args.max_steps:
@@ -282,39 +322,93 @@ def main():
             raw_rewards = compute_reward_batch(texts, ref_ans_expanded).to(device)
             norm_rewards = group_normalize_rewards(raw_rewards, g_idx.to(device))
             
+            # --- Teacher Evaluation (每10步评估一次教师，减少开销) ---
+            teacher_acc = 0.0
+            if global_step % 10 == 0:
+                # 教师只对原始问题生成（不扩展k_samples）
+                teacher_in_ids, teacher_att_mask, _ = make_generation_inputs(tokenizer, msgs, k_samples=1)
+                teacher_texts = generate_teacher_outputs(
+                    teacher, tokenizer, teacher_in_ids, teacher_att_mask, args.max_new_tokens, device
+                )
+                teacher_rewards = compute_reward_batch(teacher_texts, answers)
+                teacher_acc = teacher_rewards.mean().item()
+
+                # Save teacher samples
+                teacher_samples_file = os.path.join(args.output_dir, "teacher_samples.jsonl")
+                for i, (q, pred, ref, reward) in enumerate(zip(questions, teacher_texts, answers, teacher_rewards.tolist())):
+                    sample_entry = {
+                        "step": global_step,
+                        "sample_idx": i,
+                        "question": q,
+                        "prediction": pred,
+                        "reference": ref,
+                        "correct": reward == 1.0,
+                        "model": "teacher"
+                    }
+                    with open(teacher_samples_file, "a") as f:
+                        f.write(json.dumps(sample_entry, ensure_ascii=False) + "\n")
+            
             # --- Distillation ---
             with torch.inference_mode():
-                logp_teacher = compute_log_probs(teacher, full_ids, full_mask, labels)
+                # Teacher inference (chunked internally by compute_log_probs if needed)
+                logp_teacher = compute_log_probs(teacher, full_ids, full_mask, labels, batch_chunk_size=4)
             
-            logp_student = compute_log_probs(student, full_ids, full_mask, labels)
-            
-            # Advantage = Env + KL
-            r_kl = logp_teacher - logp_student.detach()
-            r_env = norm_rewards.unsqueeze(-1).expand_as(logp_student)
-            advantage = args.lambda_env * r_env + args.lambda_kl * r_kl
-            
-            valid_mask = (labels != -100).float()
-            loss = - (advantage * logp_student * valid_mask).sum() / valid_mask.sum()
-            
+            # Gradient Accumulation Loop
             optimizer.zero_grad()
-            loss.backward()
+            
+            valid_mask_all = (labels != -100).float()
+            total_valid_tokens = valid_mask_all.sum()
+            
+            # Use small mini-batch size to save memory during backward
+            mini_batch_size = 2 
+            total_loss = 0.0
+            
+            B_total = full_ids.shape[0]
+            for i in range(0, B_total, mini_batch_size):
+                end = min(i + mini_batch_size, B_total)
+                
+                # Slice batch
+                mb_ids = full_ids[i:end]
+                mb_mask = full_mask[i:end]
+                mb_labels = labels[i:end]
+                mb_logp_teacher = logp_teacher[i:end]
+                mb_norm_rewards = norm_rewards[i:end]
+                
+                # Student Forward
+                mb_logp_student = compute_log_probs(student, mb_ids, mb_mask, mb_labels)
+                
+                # Advantage
+                mb_r_kl = mb_logp_teacher - mb_logp_student.detach()
+                mb_r_env = mb_norm_rewards.unsqueeze(-1).expand_as(mb_logp_student)
+                mb_advantage = args.lambda_env * mb_r_env + args.lambda_kl * mb_r_kl
+                
+                # Loss
+                mb_valid_mask = (mb_labels != -100).float()
+                # Normalize by global token count to match batch loss definition
+                mb_loss = - (mb_advantage * mb_logp_student * mb_valid_mask).sum() / (total_valid_tokens + 1e-8)
+                
+                # Backward
+                mb_loss.backward()
+                
+                total_loss += mb_loss.item()
+            
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
             
             # --- Logging & Monitoring ---
             avg_acc = raw_rewards.mean().item()
-            curr_loss = loss.item()
+            curr_loss = total_loss
             
             global_step += 1
             pbar.update(1)
             
-            # Update postfix with new metrics
+            # Update postfix with new metrics (显示教师acc仅在评估步)
             postfix = {
                 "loss": f"{curr_loss:.4f}",
-                "acc": f"{avg_acc:.2f}",
-                "trunc": f"{gen_metrics['truncation_rate']:.2f}",
-                "ans_rate": f"{gen_metrics['answer_found_rate']:.2f}",
-                "len": f"{gen_metrics['avg_new_tokens']:.1f}"
+                "stu": f"{avg_acc:.2f}",
+                "tea": f"{teacher_acc:.2f}" if global_step % 10 == 0 else "-",
+                "ans": f"{gen_metrics['answer_found_rate']:.2f}",
+                "len": f"{gen_metrics['avg_new_tokens']:.0f}"
             }
             pbar.set_postfix(postfix)
             
@@ -322,11 +416,30 @@ def main():
             log_entry = {
                 "step": global_step,
                 "loss": curr_loss,
-                "accuracy": avg_acc,
+                "student_acc": avg_acc,
+                "teacher_acc": teacher_acc if global_step % 10 == 0 else None,
                 **gen_metrics
             }
             with open(log_file_path, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
+            
+            # Save samples periodically (every 10 steps) or when answer rate is high
+            if global_step % 10 == 0 or gen_metrics['answer_found_rate'] >= 0.5:
+                samples_file = os.path.join(args.output_dir, "samples.jsonl")
+                # Get questions for this batch
+                batch_questions = [questions[i] for i in g_idx.tolist()]
+                for i, (q, pred, ref, reward) in enumerate(zip(batch_questions, texts, ref_ans_expanded, raw_rewards.tolist())):
+                    sample_entry = {
+                        "step": global_step,
+                        "sample_idx": i,
+                        "question": q,
+                        "prediction": pred,
+                        "reference": ref,
+                        "correct": reward == 1.0,
+                        "answer_found_rate": gen_metrics['answer_found_rate']
+                    }
+                    with open(samples_file, "a") as f:
+                        f.write(json.dumps(sample_entry, ensure_ascii=False) + "\n")
 
             if global_step % 200 == 0:
                  student.save_pretrained(os.path.join(args.output_dir, f"ckpt_{global_step}"))

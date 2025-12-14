@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from data_loader import load_deepscaler
+from data_loader import load_gsm8k
 from reward_math import compute_reward_batch
 
 def evaluate_model(model_name, dataset, num_samples=20, batch_size=4, device="cuda"):
@@ -19,7 +19,7 @@ def evaluate_model(model_name, dataset, num_samples=20, batch_size=4, device="cu
     
     # Select subset
     subset = dataset.select(range(min(num_samples, len(dataset))))
-    questions = [ex["problem"] for ex in subset]
+    questions = [ex["question"] for ex in subset]  # GSM8K uses 'question' field
     answers = [ex["answer"] for ex in subset]
     
     all_rewards = []
@@ -34,7 +34,7 @@ def evaluate_model(model_name, dataset, num_samples=20, batch_size=4, device="cu
         messages_batch = []
         for q in batch_q:
             messages = [
-                {"role": "system", "content": "You are a helpful math assistant. Solve step by step. End with '#### ' followed by the numerical answer."},
+                {"role": "system", "content": "Solve the math problem step by step. Show your reasoning, then give the final answer as: #### <number>"},
                 {"role": "user", "content": q},
             ]
             messages_batch.append(messages)
@@ -91,10 +91,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    ds = load_deepscaler(split="train")
+    ds = load_gsm8k(split="test")  # Use test split for evaluation
     
-    student_model = "Qwen/Qwen3-1.7B"
-    teacher_model = "Qwen/Qwen3-4B-Thinking-2507"
+    student_model = "Qwen/Qwen2.5-0.5B"
+    teacher_model = "Qwen/Qwen2.5-1.5B-Instruct"
     
     # Evaluate Student
     student_stats = evaluate_model(student_model, ds, num_samples=20, device=device)
@@ -103,7 +103,7 @@ def main():
     teacher_stats = evaluate_model(teacher_model, ds, num_samples=20, device=device)
     
     print("\n" + "="*40)
-    print("FINAL COMPARISON (DeepScaleR)")
+    print("FINAL COMPARISON (GSM8K)")
     print("="*40)
     print(f"{'Metric':<20} | {'Student':<20} | {'Teacher':<20}")
     print("-" * 66)

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs
+*.log
+nohup.out
+
+# Training Outputs
+runs/
+output/
+checkpoints/
+*.jsonl
+
+# Model Weights
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+
+# IDEs
+.vscode/
+.idea/
