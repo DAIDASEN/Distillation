@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Initialize Conda hook
+eval "$(conda shell.bash hook)"
+
+# Activate the environment
+conda activate Training
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Run the training script in the background
+nohup python -u train_math_on_policy_distill.py > nohup.out 2>&1 &
+
+# Get the PID of the last background process
+PID=$!
+
+echo "Training started with PID: $PID"
+echo "Logs are being written to nohup.out"
+echo "To monitor the logs, run: tail -f nohup.out"
