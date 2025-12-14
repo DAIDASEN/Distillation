@@ -237,6 +237,9 @@ def parse_args():
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
     
+    # G. Resume
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+
     return parser.parse_args()
 
 def main():
@@ -252,14 +255,32 @@ def main():
 
     # 1. Tokenizer (CRITICAL FIX: padding_side='left')
     print("Loading tokenizer with padding_side='left'...")
-    tokenizer = AutoTokenizer.from_pretrained(args.student_model, padding_side="left")
+    # If resuming, load tokenizer from checkpoint if available, otherwise from base model
+    tokenizer_path = args.resume_from_checkpoint if args.resume_from_checkpoint else args.student_model
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, padding_side="left")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # 2. Models
     print("Loading models...")
+    
+    # Determine model path and initial step
+    model_path = args.student_model
+    global_step = 0
+    
+    if args.resume_from_checkpoint:
+        print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+        model_path = args.resume_from_checkpoint
+        # Try to extract step number from checkpoint name (e.g., ckpt_200 -> 200)
+        try:
+            step_str = os.path.basename(args.resume_from_checkpoint).split('_')[-1]
+            global_step = int(step_str)
+            print(f"Resumed global_step: {global_step}")
+        except ValueError:
+            print("Could not extract step from checkpoint name. Starting from step 0.")
+
     student = AutoModelForCausalLM.from_pretrained(
-        args.student_model,
+        model_path,
         dtype=torch.bfloat16,
     ).to(device)
     student.gradient_checkpointing_enable()
@@ -289,7 +310,7 @@ def main():
     iter_batches = iter_gsm8k_batches
     
     student.train()
-    global_step = 0
+    # global_step is already set above if resuming
 
     # --- Signal Handler for Graceful Shutdown ---
     def signal_handler(sig, frame):
@@ -399,25 +420,29 @@ def main():
             avg_acc = raw_rewards.mean().item()
             curr_loss = total_loss
             
+            # Check if we just ran teacher eval (before incrementing global_step)
+            just_eval_teacher = (global_step % 10 == 0)
+
             global_step += 1
-            pbar.update(1)
             
             # Update postfix with new metrics (显示教师acc仅在评估步)
             postfix = {
                 "loss": f"{curr_loss:.4f}",
                 "stu": f"{avg_acc:.2f}",
-                "tea": f"{teacher_acc:.2f}" if global_step % 10 == 0 else "-",
+                "tea": f"{teacher_acc:.2f}" if just_eval_teacher else "-",
                 "ans": f"{gen_metrics['answer_found_rate']:.2f}",
                 "len": f"{gen_metrics['avg_new_tokens']:.0f}"
             }
-            pbar.set_postfix(postfix)
+            # refresh=False prevents immediate printing, update(1) will print the final state
+            pbar.set_postfix(postfix, refresh=False)
+            pbar.update(1)
             
             # Write to JSONL for plotting
             log_entry = {
                 "step": global_step,
                 "loss": curr_loss,
                 "student_acc": avg_acc,
-                "teacher_acc": teacher_acc if global_step % 10 == 0 else None,
+                "teacher_acc": teacher_acc if just_eval_teacher else None,
                 **gen_metrics
             }
             with open(log_file_path, "a") as f:
