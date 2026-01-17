@@ -103,6 +103,11 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif isinstance(data_source, str) and data_source.lower().startswith("simplerl"):
+        from reward.simpleRL_rule_math import compute_reward
+
+        res = compute_reward(solution_str=solution_str, ground_truth=ground_truth)
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

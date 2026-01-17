@@ -111,3 +111,10 @@ verl = [
   "trainer/config/*.yaml",
   "trainer/config/*/*.yaml",
 ]
+
+# -------------------------------
+# tool.pytest - CPU-only smoke tests
+# -------------------------------
+[tool.pytest.ini_options]
+# Keep local `pytest -q` runnable without optional GPU/NPU deps.
+testpaths = ["tests/test_simple_rl_zoo_integration.py"]

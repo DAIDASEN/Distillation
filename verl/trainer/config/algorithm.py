@@ -608,7 +608,8 @@ class AlgoConfig(BaseConfig):
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
-    filter_groups: Optional[FilterGroupsConfig] = None
+    # Group filtering (used by some recipes; can be enabled for GRPO to drop uninformative groups).
+    filter_groups: Optional[FilterGroupsConfig] = field(default_factory=FilterGroupsConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

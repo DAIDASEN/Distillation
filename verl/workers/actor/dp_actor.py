@@ -36,6 +36,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.distill.topk_kl import sparse_kl_from_logits_topk
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
@@ -68,6 +69,18 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_fused_kernels={self.use_fused_kernels}")
+
+        distill_cfg = getattr(self.config, "distill", None)
+        if (
+            distill_cfg is not None
+            and getattr(distill_cfg, "enabled", False)
+            and self.use_fused_kernels
+        ):
+            # Distillation needs access to logits to compute KL vs teacher top-k.
+            # The fused PPO kernels only return (log_probs, entropy) without logits.
+            if torch.distributed.get_rank() == 0:
+                print(f"{role} disabling use_fused_kernels because distill.enabled=True requires logits")
+            self.use_fused_kernels = False
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
@@ -364,7 +377,6 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits = output.logits
-
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
@@ -386,6 +398,24 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+
+            distill_cfg = getattr(self.config, "distill", None)
+            if distill_cfg is not None and getattr(distill_cfg, "enabled", False):
+                teacher_topk_logps_full = micro_batch.get("teacher_topk_logps", None)
+                teacher_topk_indices_full = micro_batch.get("teacher_topk_indices", None)
+                if teacher_topk_logps_full is not None and teacher_topk_indices_full is not None:
+                    teacher_topk_logps = teacher_topk_logps_full[:, -response_length - 1 : -1, :]
+                    teacher_topk_indices = teacher_topk_indices_full[:, -response_length - 1 : -1, :]
+                    response_mask = micro_batch["response_mask"].to(torch.bool)
+                    kl_out = sparse_kl_from_logits_topk(
+                        logits=logits,
+                        teacher_topk_indices=teacher_topk_indices,
+                        teacher_topk_logps=teacher_topk_logps,
+                        mask=response_mask,
+                        chunk_size=1024,
+                    )
+                    outputs["kd_kl_losses"] = kl_out.kl_per_token
+
             return outputs
 
     def _optimizer_step(self):
@@ -527,6 +557,11 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
 
+        distill_cfg = getattr(self.config, "distill", None)
+        if distill_cfg is not None and getattr(distill_cfg, "enabled", False):
+            if "teacher_topk_logps" in data.batch.keys() and "teacher_topk_indices" in data.batch.keys():
+                select_keys.extend(["teacher_topk_logps", "teacher_topk_indices"])
+
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
         if has_multi_modal_inputs:
@@ -648,6 +683,17 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    kd_kl_losses = outputs.get("kd_kl_losses", None)
+                    if distill_cfg is not None and getattr(distill_cfg, "enabled", False) and kd_kl_losses is not None:
+                        kd_loss = agg_loss(
+                            loss_mat=kd_kl_losses,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        micro_batch_metrics["actor/kd_loss"] = kd_loss.detach().item()
+                        micro_batch_metrics["actor/distill_coef"] = float(getattr(distill_cfg, "coef", 0.0))
+                        policy_loss = policy_loss + kd_loss * float(getattr(distill_cfg, "coef", 0.0))
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

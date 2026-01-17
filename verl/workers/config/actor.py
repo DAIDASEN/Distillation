@@ -29,6 +29,21 @@ __all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorCo
 
 
 @dataclass
+class DistillConfig(BaseConfig):
+    """On-policy distillation config for actor-side KD loss and trainer-side teacher queries."""
+
+    enabled: bool = False
+    async_enabled: bool = False
+    coef: float = 0.05
+    topk: int = 50
+    teacher_host: str = "127.0.0.1"
+    teacher_port: int = 15555
+    n_server_workers: int = 1
+    teacher_max_tokens: int = 1
+    teacher_only_response: bool = False
+
+
+@dataclass
 class RouterReplayConfig(BaseConfig):
     """Configuration for router replay in MoE models.
 
@@ -164,6 +179,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    distill: DistillConfig = field(default_factory=DistillConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size

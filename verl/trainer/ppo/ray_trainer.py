@@ -1518,6 +1518,36 @@ class RayPPOTrainer:
                                 batch, reward_fn=self.reward_fn, reward_for_val=False
                             )
 
+                    # Optional GRPO group filtering based on outcome reward.
+                    # We only do this in sync-reward mode so we can filter before expensive forward passes.
+                    if not self.config.reward_model.launch_reward_fn_async:
+                        batch.batch["token_level_scores"] = reward_tensor
+                        reward_extra_keys = list(reward_extra_infos_dict.keys()) if reward_extra_infos_dict else []
+                        if reward_extra_infos_dict:
+                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                            from verl.trainer.ppo.group_filter import maybe_discard_grpo_trivial_groups
+
+                            batch, filter_metrics = maybe_discard_grpo_trivial_groups(
+                                batch=batch,
+                                token_level_scores=batch.batch["token_level_scores"],
+                                rollout_n=self.config.actor_rollout_ref.rollout.n,
+                                filter_groups_cfg=self.config.algorithm.filter_groups,
+                            )
+                            metrics.update(filter_metrics)
+                            # Keep python-side reward tensor aligned with (potentially) filtered batch.
+                            reward_tensor = batch.batch["token_level_scores"]
+                            if reward_extra_keys:
+                                reward_extra_infos_dict = {
+                                    k: batch.non_tensor_batch[k].tolist()
+                                    for k in reward_extra_keys
+                                    if k in batch.non_tensor_batch
+                                }
+
+                        # meta_info arrays are batch-size dependent; refresh after filtering.
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
